@@ -1,0 +1,24 @@
+<?xml version="1.0" ?>
+<robot name="duck">
+  <link name="baseLink">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="duck.obj" scale="0.05 0.05 0.05"/> <!-- 缩放比例 -->
+      </geometry>
+      <material name="bright_yellow">
+        <color rgba="1 1 0 1"/> <!-- 设置颜色为亮黄色 -->
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="duck.obj" scale="0.05 0.05 0.05"/> <!-- 碰撞形状 -->
+      </geometry>
+    </collision>
+    <inertial>
+      <mass value="1.0"/>
+      <inertia ixx="1" ixy="0" ixz="0" iyy="1" iyz="0" izz="1"/>
+    </inertial>
+  </link>
+</robot>
