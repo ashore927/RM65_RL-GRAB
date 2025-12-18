@@ -438,7 +438,7 @@
   <!--  相机URDF模型  -->
   <link name="camera_link">
     <visual>
-      <origin xyz="0.0149 -0.0175 0.0125" rpy="1.5708 0 1.5708"/>
+      <origin xyz="0.01 -0.0175 0.0" rpy="1.5708 0 1.5708"/>
       <geometry>
         <mesh filename="./meshes/camera/d435.dae" scale="1 1 1"/>
       </geometry>
@@ -447,7 +447,7 @@
       </material>
     </visual>
     <collision>
-      <origin xyz="0.0025 -0.0175 0.0125" rpy="1.5708 1.5708 1.5708"/>
+      <origin xyz="-0.002 -0.0175 0.0" rpy="1.5708 1.5708 1.5708"/>
       <geometry>
         <box size="0.02505 0.09 0.025"/>
       </geometry>
@@ -462,7 +462,7 @@
   <joint name="camera_joint" type="fixed">
     <parent link="Camera_base_link"/>  <!-- 修改为你的机械臂末端链接名 -->
     <child link="camera_link"/>
-    <origin xyz="0.0645 0.108 0.01855" rpy="1.5708 -1.5708 3.1416"/>  <!-- 调整安装位置 -->
+    <origin xyz="0.062 0.1215 0.0225" rpy="1.5708 -1.5708 3.1416"/>  <!-- 调整安装位置 -->
   </joint>
 
 
