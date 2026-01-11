@@ -86,48 +86,53 @@ class Env(gym.Env):
             return robot
 
     def lock_all_joints(self, body_id, force_scale=50.0, min_force=10.0):
-        """使用 POSITION_CONTROL 将 `body_id` 的所有旋转/平移关节锁定在当前的位置，
-        使关节能够抵抗外部力（如鼠标拖动）。
-
-        参数：
-            body_id: int，pybullet 物体的唯一 ID
-            force_scale: URDF 力量的乘数，用于计算电机力
-            min_force: 最小电机力
-        """
+        """锁定关节并启用限位约束"""
         num_j = self.physics_client.getNumJoints(body_id)
-        # 提高求解器迭代次数以增加约束求解稳定性
-        try:
-            self.physics_client.setPhysicsEngineParameter(numSolverIterations=200)
-        except Exception:
-            pass
+        
+        # 识别夹爪关节名称（WSG50 平行夹爪）
+        gripper_joint_names = {'wsg50_finger_left_joint', 'wsg50_finger_right_joint'}
+        
+        for joint_idx in range(num_j):
+            info = self.physics_client.getJointInfo(body_id, joint_idx)
+            joint_type = info[2]
+            joint_name = info[1].decode('utf-8') if isinstance(info[1], bytes) else str(info[1])
+            
+            if joint_type in [p.JOINT_REVOLUTE, p.JOINT_PRISMATIC]:
+                lower_limit = info[8]
+                upper_limit = info[9]
+                
+                # 对夹爪关节使用更大的力矩，防止外力推动和穿模
+                if joint_name in gripper_joint_names:
+                    control_force = 500.0  # 夹爪关节使用超强力矩
+                    limit_force = 5000.0   # 限位约束力提高5倍
+                else:
+                    control_force = max(info[10] * force_scale, min_force)
+                    limit_force = 1000.0
+                
 
-        for j in range(num_j):
-            try:
-                info = self.physics_client.getJointInfo(body_id, j)
-                jtype = info[2]
-                lower, upper, effort = info[8], info[9], info[10]
-                if jtype in (p.JOINT_REVOLUTE, p.JOINT_PRISMATIC):
-                    cur = self.physics_client.getJointState(body_id, j)[0]
-                    # clamp 到上下限（若有限位）
-                    if lower < upper:
-                        cur = min(max(cur, lower), upper)
-                    max_force = max(min_force, float(effort) * force_scale if effort is not None else min_force)
-                    # 使用 POSITION_CONTROL 将电机锁住到当前角度
-                    self.physics_client.setJointMotorControl2(
-                        bodyIndex=body_id,
-                        jointIndex=j,
-                        controlMode=p.POSITION_CONTROL,
-                        targetPosition=cur,
-                        force=max_force
-                    )
-                    # 增加关节阻尼以减少抖动
-                    try:
-                        self.physics_client.changeDynamics(body_id, j, linearDamping=0.04, angularDamping=0.04)
-                    except Exception:
-                        pass
-            except Exception:
-                # 跳过无法处理的关节
-                continue
+                """解决夹爪半开半合/慢速问题：
+
+                    将 force 增加到 500.0（极大值）。
+                    关键点：显式设置 maxVelocity=10.0。URDF 中默认限制是 1.0 rad/s，这导致夹爪开合至少需要 0.75 秒，看起来很慢且像卡住。现在允许它以 10 倍速度运动。
+                    调整了 Gain 参数以匹配高速运动。
+                """
+                # 启用关节限位（默认是禁用的）
+                self.physics_client.setJointMotorControl2(
+                    body_id, joint_idx,
+                    p.POSITION_CONTROL,
+                    targetPosition=self.physics_client.getJointState(body_id, joint_idx)[0],
+                    force=control_force,
+                    maxVelocity=0.5  # 限制速度防止突变
+                )
+                
+                # 关键：显式启用关节限位约束
+                self.physics_client.changeDynamics(
+                    body_id, joint_idx,
+                    jointLowerLimit=lower_limit,
+                    jointUpperLimit=upper_limit,
+                    jointLimitForce=limit_force,
+                    jointDamping=1.0  # 增加阻尼稳定关节
+                )
     
     def run(self, duration):
         for _ in range(int(duration / self._time_step)):
@@ -142,75 +147,102 @@ class Env(gym.Env):
                        time.time() + self._real_start_time))
 
     def reset_sim(self):
-        self.physics_client.resetSimulation()
-        # 提高求解精度并启用 CCD 限制穿模
-        self.physics_client.setPhysicsEngineParameter(
-            fixedTimeStep=self._time_step,
-            numSolverIterations=max(self._solver_iterations, 300),
-            contactBreakingThreshold=0.001,
-            allowedCcdPenetration=0.001,
-            enableConeFriction=1)
-        self.physics_client.setGravity(0., 0., -9.81)    
-        self.models = []
+        # [优化] 不再调用 resetSimulation()，避免销毁所有对象
+        # 仅重置物理状态和时间
         self.sim_time = 0.
-
         self._real_start_time = time.time()
 
-        # reset 后重建测试场景（init_test_env 会加载桌子、机器人等）
-        try:
-            self.init_test_env()
-        except Exception:
-            # 忽略重建错误，保留空场景以便上层处理
-            pass
+        # 1. 重置机器人关节到初始姿态
+        self.set_initial_joint_angles()
+        
+        # 2. 重置桌上物体的位置和姿态
+        # 强制将方块以平面朝上放置（四元数 [0,0,0,1] 表示无旋转）
+        # 小扰动角度（±1 度以内）
+        eps = 0.02
+        rx = self._rng.uniform(-eps, eps)
+        ry = self._rng.uniform(-eps, eps)
+        rz = self._rng.uniform(-eps, eps)
+        orn = self.physics_client.getQuaternionFromEuler([rx, ry, rz])
+        
+        # 假设第一个物体是立方体，重置到初始位置
+        if len(self.objects) > 0:
+            cube_id = self.objects[0]
+            # 重置位置和速度（线速度/角速度清零）
+            self.physics_client.resetBasePositionAndOrientation(
+                cube_id, [-0.3, 0.0, 0.1], orn
+            )
+            self.physics_client.resetBaseVelocity(cube_id, [0, 0, 0], [0, 0, 0])
+
+        # 3. 让仿真跑一小段时间以稳定物体（消除重置带来的瞬时穿模力）
+        for _ in range(50):
+            self.physics_client.stepSimulation()
+            
+        # 4. 重新锁定关节（防止外力干扰）
+        if self.robot_id is not None:
+            self.lock_all_joints(self.robot_id)
         
 
     def set_initial_joint_angles(self):
         """Set the robot to a neutral pose by resetting joint states.
 
-        使用角度（度）列表并将其转换为弧度后调用 `resetJointState`。
+        使用弧度列表调用 `resetJointState`，末端姿态为垂直向下，指向X正半轴。
         """
-        neutral_deg = [0.0, 10, 80, 0, 70, 0]
-        neutral_rad = [math.radians(angle) for angle in neutral_deg]
+        # 末端姿态居中的关节角（弧度）
+        # Joint1 设为 0（居中），提供双向±2π的活动空间
+        neutral_rad = [
+            0.0,        # Joint1:  0° - 居中位置，双向均有活动空间
+            -0.034601,  # Joint2:  -1.9825°
+            1.578469,   # Joint3:  90.4396°
+            0.000004,   # Joint4:   0.0002°
+            1.597716,   # Joint5:  91.5424°
+            0.0         # Joint6:  0° - 居中
+        ]
 
         for joint_index, joint_angle in enumerate(neutral_rad):
-            # 使用 physics_client 的 resetJointState，适用于 BulletClient
-            try:
-                self.physics_client.resetJointState(self.robot_id, joint_index, joint_angle)
-            except Exception:
-                # 如果某个 joint_index 超出范围，忽略并继续
-                pass
+            self.physics_client.resetJointState(self.robot_id, joint_index, joint_angle)
 
     def add_objects_on_table(self):
         """放置几个示例物体，使用可控质量的 createMultiBody（避免 URDF 质量过小）。"""
-        # 立方体（50g -> 1.0kg）
-        box_col = self.physics_client.createCollisionShape(self.physics_client.GEOM_BOX, halfExtents=[0.03,0.03,0.03])
-        box_vis = self.physics_client.createVisualShape(self.physics_client.GEOM_BOX, halfExtents=[0.03,0.03,0.03], rgbaColor=[1,0,0,1])
-        cube_id = self.physics_client.createMultiBody(baseMass=2.0, baseCollisionShapeIndex=box_col, baseVisualShapeIndex=box_vis,
-                                                     basePosition=[-0.5, 0.0, 0.1], baseOrientation=[0,0,0,1])
+        # 立方体（缩小尺寸和质量，使其容易被小夹爪夹取）
+        cube_scale = 0.2 ** (1 / 3)  # 体积缩小到40%
+        cube_half = 0.03 * cube_scale  # 夹爪更容易夹住
+        cube_mass = 0.15  # 质量极轻，便于夹爪夹取和举起
+        box_col = self.physics_client.createCollisionShape(
+            self.physics_client.GEOM_BOX, halfExtents=[cube_half, cube_half, cube_half])
+        box_vis = self.physics_client.createVisualShape(
+            self.physics_client.GEOM_BOX, halfExtents=[cube_half, cube_half, cube_half], rgbaColor=[1, 0, 0, 1])
+        cube_id = self.physics_client.createMultiBody(
+            baseMass=cube_mass,
+            baseCollisionShapeIndex=box_col,
+            baseVisualShapeIndex=box_vis,
+            basePosition=[-0.3, 0.0, 0.1],  # 前方（正Y）30cm处
+            baseOrientation=[0, 0, 0, 1]
+        )
         self.objects.append(cube_id)
+        
+        # 为立方体设置高摩擦力，便于夹爪抓取
+        self.physics_client.changeDynamics(
+            cube_id, -1,
+            lateralFriction=1.5,  # 极高摩擦，防止夹爪滑动
+            spinningFriction=0.5,
+            rollingFriction=0.1,
+            restitution=0.0,      # 完全非弹性
+            linearDamping=0.05,
+            angularDamping=0.05
+        )
 
         # 强制将方块以平面朝上放置（四元数 [0,0,0,1] 表示无旋转）
-        self.physics_client.resetBasePositionAndOrientation(cube_id, [-0.5, 0.0, 0.1], [0, 0, 0, 1])
+        # 小扰动角度（±1 度以内）
+        eps = 0.02
+        rx = self._rng.uniform(-eps, eps)
+        ry = self._rng.uniform(-eps, eps)
+        rz = self._rng.uniform(-eps, eps)
 
-        # 球体（指定半径和质量）
-        sph_col = self.physics_client.createCollisionShape(self.physics_client.GEOM_SPHERE, radius=0.03)
-        sph_vis = self.physics_client.createVisualShape(self.physics_client.GEOM_SPHERE, radius=0.03, rgbaColor=[0,1,0,1])
-        sphere_id = self.physics_client.createMultiBody(baseMass=1.0, baseCollisionShapeIndex=sph_col, baseVisualShapeIndex=sph_vis,
-                                                       basePosition=[-0.4, 0.1, 0.1], baseOrientation=[0,0,0,1])
-        self.objects.append(sphere_id)
+        orn = self.physics_client.getQuaternionFromEuler([rx, ry, rz])
+        self.physics_client.resetBasePositionAndOrientation(
+            cube_id, [-0.3, 0.0, 0.1], orn
+        )
 
-        # 对于复杂 URDF（如 duck），建议直接编辑 URDF 的 inertial mass；
-        # 临时替换为简单可视对象或手动修改 URDF 并 reload
-        try:
-            duck_id = self.physics_client.loadURDF(os.path.join("./URDF/objects/duck/duck.urdf"),
-                                                  basePosition=[-0.4, 0.15, 0.1],
-                                                  baseOrientation=[0, 0, 0, 1], globalScaling=1)
-            # 打印质量，若太小请修改 urdf 中的 <inertial>
-            dyn = self.physics_client.getDynamicsInfo(duck_id, -1)
-            print("duck mass:", dyn[0])
-            self.objects.append(duck_id)
-        except Exception:
-            pass
 
     def init_env(self, camera_config=None):
         """初始化或重建测试环境：机器人、桌子、物体和相机。
@@ -220,31 +252,48 @@ class Env(gym.Env):
         self.physics_client.setAdditionalSearchPath(pybullet_data.getDataPath())
 
         # 确保重力与物理参数在加载物体前生效，避免物体“悬浮”
-        try:
-            self.physics_client.setGravity(0, 0, -9.81)
-            self.physics_client.setPhysicsEngineParameter(fixedTimeStep=self._time_step,
-                                                          numSolverIterations=max(self._solver_iterations, 300),
-                                                          contactBreakingThreshold=0.001,
-                                                          allowedCcdPenetration=0.001)
-        except Exception:
-            pass
+        self.physics_client.setGravity(0, 0, -9.81)
+        # 使用高精度参数，确保仿真稳定性
+        self.physics_client.setPhysicsEngineParameter(
+            fixedTimeStep=self._time_step,
+            numSolverIterations=500,              # 提高到500次迭代
+            numSubSteps=10,                       # 增加子步数
+            contactBreakingThreshold=0.0005,      # 更小的接触断裂阈值
+            allowedCcdPenetration=0.0001,         # 更严格的CCD穿透限制
+            enableConeFriction=1,
+            erp=0.8,                              # 误差修正参数
+            contactERP=0.9,                       # 接触误差修正
+            frictionERP=0.9,                      # 摩擦误差修正
+            constraintSolverType=p.CONSTRAINT_SOLVER_LCP_DANTZIG,
+            globalCFM=0.00001
+        )
 
         # 加载机器人并记录 body id
-        self.robot_id = self.add_robot("./URDF/rm65.urdf", [0, 0, 0], [0, 0, 0, 1], scaling=1.)
+        # 使用集成了 WSG50 夹爪的 URDF
+        self.robot_id = self.add_robot("./URDF/rm65_wsg50.urdf", [0, 0, 0], [0, 0, 0, 1], scaling=1.)
 
         # 解析 URDF 中的 mimic 关系（如果有），用于在 UI 中自动联动从动关节
         try:
-            urdf_path = os.path.join("./URDF/rm65.urdf")
+            urdf_path = os.path.join("./URDF/rm65_wsg50.urdf")
             self._parse_urdf_mimics(urdf_path)
         except Exception:
             self.mimic_slave_to_master = {}
             self.mimic_master_to_slaves = {}
 
-        # 加载桌子
+        # 加载桌子（X正半轴）
         self.table_id = self.physics_client.loadURDF(
             os.path.join("./URDF/objects/table/table.urdf"),
             basePosition=[-0.65, 0.0, -0.63],
             baseOrientation=[0, 0, 0, 1]
+        )
+        
+        # 给桌子表面加高friction，防止物体滑动
+        self.physics_client.changeDynamics(
+            self.table_id, -1,
+            lateralFriction=3.0,
+            spinningFriction=2.5,
+            contactStiffness=50000,
+            contactDamping=5000
         )
 
         # 固定机器人基座到世界
@@ -267,51 +316,68 @@ class Env(gym.Env):
         self.add_objects_on_table()
 
         # 确保物体具有合适的摩擦/弹性，减少被反弹的情况
-        try:
-            body_list = list(self.objects)
-            if self.table_id is not None:
-                body_list.append(self.table_id)
-            for bid in body_list:
-                try:
-                    # 只设置 base (-1)，根据需要可设置每个 link
-                    self.physics_client.changeDynamics(bid, -1,
-                                                       restitution=0.0,
-                                                       lateralFriction=1.0,
-                                                       spinningFriction=0.1,
-                                                       rollingFriction=0.1)
-                except Exception:
-                    pass
-        except Exception:
-            pass
+        # 仅对非球体、非桌子的物体应用通用设置
+        # 球体和桌子已在创建时单独设置了高摩擦
+        for oid in self.objects:
+            # 简单判断：如果是球体（mass=0.5且有特殊设置），跳过覆盖
+            # 这里通过 getDynamicsInfo 检查 friction 是否已经是高值来决定是否覆盖
+            dyn = self.physics_client.getDynamicsInfo(oid, -1)
+            current_lat_fric = dyn[1]
+            
+            # 如果摩擦力已经很高（>1.0），说明是特殊设置的物体（如球体），跳过
+            if current_lat_fric > 1.0:
+                continue
+                
+            self.physics_client.changeDynamics(
+                oid, -1,
+                restitution=0.05,
+                lateralFriction=0.7,
+                spinningFriction=0.02,
+                rollingFriction=0.02,
+                linearDamping=0.0,
+                angularDamping=0.01,
+            )
         
-        # 让仿真跑一段时间以让物体在重力和碰撞下稳定落到桌面上
-        try:
-            self.run(1.0)  # 1s，视情况调整
-        except Exception:
-            pass
-
-        # 调试输出：打印质量与接触信息，便于排查仍然悬浮/弹开的原因
-        try:
-            for oid in self.objects:
-                dyn = self.physics_client.getDynamicsInfo(oid, -1)
-                print(f"obj {oid} mass={dyn[0]}, friction={dyn[1] if len(dyn)>1 else 'N/A'}")
-                contacts = self.physics_client.getContactPoints(bodyA=oid, bodyB=self.table_id) if self.table_id is not None else []
-                print(f"obj {oid} contact points with table: {len(contacts)}")
-        except Exception:
-            pass
-
+        # 为夹爪链接设置特殊的碰撞和动力学参数，防止穿模
+        if self.robot_id is not None:
+            # WSG50 平行夹爪的 link 名称
+            gripper_link_names = ['wsg50_base_link', 'wsg50_gripper_left', 'wsg50_gripper_right', 
+                                    'wsg50_finger_left', 'wsg50_finger_right']
+            num_j = self.physics_client.getNumJoints(self.robot_id)
+            for j in range(num_j):
+                info = self.physics_client.getJointInfo(self.robot_id, j)
+                link_name = info[12].decode('utf-8') if isinstance(info[12], bytes) else str(info[12])
+                if link_name in gripper_link_names:
+                    # 夹爪指尖需要极高摩擦
+                    if 'finger' in link_name:
+                        lateral_friction = 2.0  # 指尖极高摩擦
+                        contact_stiffness = 50000.0
+                        contact_damping = 5000.0
+                    else:
+                        lateral_friction = 1.0
+                        contact_stiffness = 10000.0
+                        contact_damping = 1000.0
+                    
+                    self.physics_client.changeDynamics(
+                        self.robot_id, j,
+                        lateralFriction=lateral_friction,  # 指尖或链接的摩擦
+                        spinningFriction=0.1,
+                        rollingFriction=0.05,
+                        restitution=0.0,            # 无弹性
+                        linearDamping=0.1,          # 线性阻尼
+                        angularDamping=0.2,         # 角阻尼
+                        contactStiffness=contact_stiffness,   # 接触刚度
+                        contactDamping=contact_damping,       # 接触阻尼
+                        collisionMargin=0.0001      # 极小碰撞边距
+                    )
+        
         # 加载并设置完初始角度后，用电机锁住所有关节，防止外力直接改变角度
-        try:
-            if self.robot_id is not None:
-                self.lock_all_joints(self.robot_id)
-        except Exception:
-            pass
-
+        if self.robot_id is not None:
+            self.lock_all_joints(self.robot_id)
         # 初始化相机配置
         if camera_config is None:
+            # [优化] 移除不再使用的 yaml 路径，sensor.py 已改为硬编码
             camera_config = {
-                'camera_info': './config/camera_info.yaml',
-                'transform': './config/camera_transform.yaml',
                 'randomize': {
                     'focal_length': 5.0,
                     'optical_center': 2.0,
@@ -327,36 +393,43 @@ class Env(gym.Env):
             self.sensor = None
 
         # 在相机固定的 link 上绘制调试坐标
-        cam_link = self.find_link_index("camera_link")
-        if cam_link == -1:
-            cam_link = 7
+        # cam_link = self.find_link_index("camera_link")
+        # if cam_link == -1:
+        cam_link = 7
         self.mark_camera_position(cam_link)
 
         # 记录 realtime 同步起始时间
         self._real_start_time = time.time()
         # 创建实时关节控制面板（滑块），用于在 GUI 中实时调节每个关节目标角
-        try:
-            self.create_joint_control_panel()
-        except Exception:
-            pass
+        # try:
+        #     self.create_joint_control_panel()
+        # except Exception:
+        #     pass
 
         # 设置初始相机为桌面侧方视角，便于观察机械臂与桌面
-        try:
-            # 若没有指定目标点，则以桌面附近为目标
-            self.set_side_camera_view()
-        except Exception:
-            pass
+        self.set_side_camera_view()
         # 可视化相机视锥（调试用）
-        self.sensor.draw_camera_frustum(depth=1.0)
+        # self.sensor.draw_camera_frustum(depth=1.0)
+
+    def get_gripper_force(self):
+        """获取夹爪与立方体之间的接触力，用于调试为什么夹不起来"""
+        if not self.objects:
+            return 0.0
+        
+        cube_id = self.objects[0]  # 假设第一个物体是立方体
+        # [优化] 移除 try-except
+        contacts = self.physics_client.getContactPoints(bodyA=cube_id, bodyB=self.robot_id)
+        if not contacts:
+            return 0.0
+        total_force = sum([contact[9] for contact in contacts])  # contact[9] 是法向力
+        return total_force
 
     def get_sensor_data(self):
         """If RGBDSensor 已初始化，则返回 (rgb, depth, mask)，否则返回 (None, None, None)。"""
         if self.sensor is None:
             return None, None, None
-        try:
-            return self.sensor.get_state()
-        except Exception:
-            return None, None, None
+        # [优化] 移除 try-except
+        return self.sensor.get_state()
 
     def mark_camera_position(self, link_index):
         """在给定的机器人关节索引处绘制 RGB 轴和文本标签.
@@ -421,7 +494,7 @@ class Env(gym.Env):
         if target_pos is None:
             # 优先用桌子位置作为观察目标，否则用机器人基座或原点
             if self.table_id is not None:
-                # table 在 init_env 中以 basePosition=[-0.65, 0.0, -0.63] 加载，
+                # table 在 init_env 中以 basePosition=[0.65, 0.0, -0.63] 加载，
                 # 将观察目标提升到桌面大致高度（z≈0）
                 target_pos = [-0.65, 0.0, 0.0]
             elif self.robot_id is not None:
@@ -487,22 +560,38 @@ class Env(gym.Env):
         """
         if not hasattr(self, 'joint_ui_params') or self.robot_id is None:
             return
+        
+        # 识别夹爪主关节（WSG50 平行夹爪）
+        gripper_master_joints = {'wsg50_finger_left_joint', 'wsg50_finger_right_joint'}
+        
         for j, pid in self.joint_ui_params.items():
             try:
                 target = float(self.physics_client.readUserDebugParameter(pid))
             except Exception:
                 continue
             info = self.physics_client.getJointInfo(self.robot_id, j)
-            effort = info[10] if info and len(info) > 10 else 50.0
-            # 设定一个合理的力矩上限，确保电机能抵抗外力
-            max_force = max(20.0, float(effort) * 50.0)
+            joint_name = info[1].decode('utf-8') if isinstance(info[1], bytes) else str(info[1])
+            
+            # 夹爪主关节使用超强力矩
+            if joint_name in gripper_master_joints:
+                max_force = 500.0
+                max_vel = 0.5
+                pos_gain = 0.8
+            else:
+                effort = info[10] if info and len(info) > 10 else 50.0
+                max_force = max(20.0, float(effort) * 50.0)
+                max_vel = 1.0
+                pos_gain = 0.3
+            
             try:
                 self.physics_client.setJointMotorControl2(
                     bodyIndex=self.robot_id,
                     jointIndex=j,
                     controlMode=p.POSITION_CONTROL,
                     targetPosition=target,
-                    force=max_force
+                    force=max_force,
+                    maxVelocity=max_vel,
+                    positionGain=pos_gain
                 )
             except Exception:
                 pass
@@ -524,14 +613,16 @@ class Env(gym.Env):
                     slave_target = float(master_target) * float(mult) + float(offs)
                     try:
                         info = self.physics_client.getJointInfo(self.robot_id, slave_idx)
-                        effort = info[10] if info and len(info) > 10 else 50.0
-                        max_force = max(20.0, float(effort) * 50.0)
+                        # mimic从动关节使用超强力矩，确保严格跟随不失步
+                        max_force = 500.0  # 固定使用大力矩
                         self.physics_client.setJointMotorControl2(
                             bodyIndex=self.robot_id,
                             jointIndex=slave_idx,
                             controlMode=p.POSITION_CONTROL,
                             targetPosition=slave_target,
-                            force=max_force
+                            force=max_force,
+                            maxVelocity=0.5,  # 限制速度保持同步
+                            positionGain=0.8  # 增加位置增益
                         )
                     except Exception:
                         continue

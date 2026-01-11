@@ -21,13 +21,23 @@ class RGBDSensor:
         self._physics_client = physics_client   # 获取物理客户端
         self._robot = robot_id  # 获取机器人对象
         full_obs = config.get('full_observation', False)  # 是否使用完整观测（RGB + 深度）
-        intrinsics_path = config['camera_info']  # 相机内参文件路径
-        extrinsics_path = config['transform']  # 相机外参文件路径
-        print("Loading camera intrinsics from: ", intrinsics_path)
-        print("Loading camera extrinsics from: ", extrinsics_path)
-        extrinsics_dict = io_utils.load_yaml(extrinsics_path)  #    YAML  加载相机外参
-        self._camera_info = io_utils.load_yaml(intrinsics_path)  #  YAML  加载相机内参
-        self._transform = transform_utils.from_dict(extrinsics_dict)  # 将YAML加载的相机外参转换为矩阵形式
+        # [优化] 直接硬编码相机参数，避免频繁读取 YAML 文件
+        # 硬编码 camera_info.yaml 内容 (64x64)
+        self._camera_info = {
+            'height': 64,
+            'width': 64,
+            'K': [69.76, 0.0, 32.19, 0.0, 77.25, 32.0, 0.0, 0.0, 1.0],
+            'near': 0.02,
+            'far': 2.0
+        }
+        
+        # 硬编码 camera_transform.yaml 内容
+        extrinsics_dict = {
+            'translation': [0.0, 0.0, 0.0],
+            'rotation': [0.5, -0.5, 0.5, -0.5]
+        }
+        
+        self._transform = transform_utils.from_dict(extrinsics_dict)
 
         self._randomize = config.get('randomize', None) if randomize else None  # 获取随机化参数
 

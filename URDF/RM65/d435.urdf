@@ -1,0 +1,35 @@
+<!-- 保存为 d435.urdf -->
+<robot name="d435_camera">
+
+  <!-- 视觉网格路径需替换为实际路径 -->
+  <link name="camera_link">
+    <visual>
+      <origin xyz="0.01 -0.0175 0.0" rpy="1.5708 0 1.5708"/>
+      <geometry>
+        <mesh filename="./meshes/camera/d435.dae" scale="1 1 1"/>
+      </geometry>
+      <material name="aluminum">
+        <color rgba="0.5 0.5 0.5 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="-0.002 -0.0175 0.0" rpy="1.5708 1.5708 1.5708"/>
+      <geometry>
+        <box size="0.02505 0.09 0.025"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <mass value="0.564"/>
+      <inertia ixx="0.003881" ixy="0" ixz="0" iyy="0.000499" iyz="0" izz="0.003879"/>
+    </inertial>
+  </link>
+
+  <!-- 相机光学坐标系（PyBullet需要Z轴朝前） -->
+  <link name="camera_optical_frame"/>
+  <joint name="camera_joint" type="fixed">
+    <parent link="camera_link"/>
+    <child link="camera_optical_frame"/>
+    <origin xyz="0 0 0" rpy="-1.5708 0 -1.5708"/>
+  </joint>
+
+</robot>
