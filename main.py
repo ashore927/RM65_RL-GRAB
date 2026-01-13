@@ -52,7 +52,7 @@ def main():
 
     # 多进程并行训练配置
     # Windows 下建议 n_envs <= CPU核心数，且开启多进程启动较慢，请耐心等待
-    n_envs = 14  # 使用4个并行环境提高采样效率
+    n_envs = 16  # 使用4个并行环境提高采样效率
     print(f"正在启动 {n_envs} 个并行环境...")
     
     # 使用 SubprocVecEnv 进行多进程并行计算
@@ -129,7 +129,7 @@ def main():
     
     print("开始训练 SAC 模型...")
     model.learn(
-        total_timesteps=100_000, 
+        total_timesteps=1000_000, 
         callback=[checkpoint_cb, sync_cb, eval_cb],
         progress_bar=True
     )

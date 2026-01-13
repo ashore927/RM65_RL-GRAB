@@ -87,7 +87,7 @@ class RobotGraspEnv(gym.Env):
         self.gripper_kd = 5.0
         
         # 减少单次探索长度，加快 reset 频率
-        self.max_episode_steps = 80
+        self.max_episode_steps = 50
         self.current_step = 0
         
         # 动作空间：末端位置增量 (dx, dy, dz) + 末端偏航增量 (dyaw) + 夹爪控制，共5维，范围 [-1, 1]
@@ -123,7 +123,7 @@ class RobotGraspEnv(gym.Env):
         self.rel_pos_norm_scale = 0.5  # 米；物体相对末端的位置误差一般在 0.5m 以内
         
         # 任务相关参数
-        self.target_height = 0.3  # 物体需要达到的高度
+        self.target_height = 0.15  # 物体需要达到的高度（初始高度约13mm + 抬升150mm）
 
         # 末端工作空间限制（用于避免 IK 目标越界导致“末端不动 -> stalled”）
         # 可通过 config['ee_workspace'] 配置：
@@ -191,15 +191,15 @@ class RobotGraspEnv(gym.Env):
         self.curriculum_hover_counter = 0
         self.curriculum_xy_thresh = 0.03          # 3 cm 平面对准阈值（更容易学习）
         self.curriculum_approach_height = 0.10     # 阶段 1：末端需在物体上方 10 cm
-        self.curriculum_lift_height = 0.20         # 阶段 3：物体抬升 20 cm
-        self.curriculum_hover_time = 3.0           # 阶段 3：悬停 3 s
+        self.curriculum_lift_height = 0.15         # 阶段 3：物体抬升 15 cm
+        self.curriculum_hover_time = 1.0           # 阶段 3：悬停 1 s
         step_dt = (self.action_repeat * self.sim_substeps) / float(self.control_frequency)
         self.curriculum_hover_steps = max(1, int(np.ceil(self.curriculum_hover_time / max(step_dt, 1e-8))))
 
         # 缓存变量初始化
         self.desired_angles = None
-        self.gripper_joints_cache = {}
-        self.gripper_link_indices = []
+        self.gripper_joints_cache = None
+        self.gripper_link_indices = None
         self.pc_cache = None
         self.gripper_base_link_idx = None
         self.initial_object_height = None
@@ -259,185 +259,95 @@ class RobotGraspEnv(gym.Env):
         return both_contact and is_not_empty
 
     def _compute_reward(self):
-        """计算奖励函数 - 三阶段设计（修复版）
+        """极简奖励函数 - 防止钻空子版本
         
-        阶段 1：XY 对齐
-            - 末端 base_link 中心与物体中心在 XY 平面对齐
-            - 对齐阈值：XY 距离 < 5mm
-            - 高度保持：惩罚高度偏离，防止上升逃避
-            
-        阶段 2：下降 + 抓取（仅当 XY 已对齐）
-            - 下降到物体高度，闭合夹爪包裹物体
-            - 抓取判定：双指接触物体且夹爪未完全闭合
-            
-        阶段 3：抬升（仅当已抓住物体）
-            - 将物体抬升至初始高度 + 0.3m
-            - 达成后获得终止奖励
+        设计原则：
+        1. 未抓取时：奖励3D距离减少（势能差）
+        2. 抓取成功：整个episode只发一次
+        3. 抓取后：奖励物体高度增加（势能差）
+        4. 松开物体：惩罚（防止反复抓放）
+        5. 任务完成：一次性大奖励
         """
         reward = 0.0
         reward_info = {}
         
-        # ========== 获取状态信息 ==========
+        # 获取状态
         tip_pos, _ = self._get_tip_position()
-        
         if self.object_id is None:
-            return -0.01, {'total': -0.01}
+            return 0.0, {'total': 0.0}
         
         obj_pos, _ = self.base_env.physics_client.getBasePositionAndOrientation(self.object_id)
         
-        # 计算距离
-        rel_pos = np.array(obj_pos) - np.array(tip_pos)
-        xy_dist = float(np.linalg.norm(rel_pos[:2]))
-        z_dist = float(tip_pos[2] - obj_pos[2])  # 末端比物体高多少
-        
-        # 记录物体初始高度（用于抬升目标计算）
+        # 记录初始高度
         if self.initial_object_height is None:
             self.initial_object_height = obj_pos[2]
         
-        # 记录末端初始高度（用于高度保持）
-        if not hasattr(self, '_initial_tip_height') or self._initial_tip_height is None:
-            self._initial_tip_height = tip_pos[2]
-        
-        # 阶段判断
-        XY_ALIGN_THRESHOLD = 0.005  # 5mm
-        is_xy_aligned = xy_dist < XY_ALIGN_THRESHOLD
+        # 核心状态判断
         is_grasped = self.object_detected()
-        target_lift_height = self.initial_object_height + 0.30  # 初始高度 + 30cm
-        is_lifted = obj_pos[2] > target_lift_height
+        is_success = obj_pos[2] > self.initial_object_height + 0.15  # 抬升15cm算成功
         
-        # ========== 基础时间惩罚 ==========
-        TIME_PENALTY = -0.1
-        reward += TIME_PENALTY
+        # 记录上一步是否抓住（用于检测松开）
+        was_grasped = getattr(self, '_was_grasped', False)
         
-        # ========== 阶段 1：XY 对齐 ==========
-        # XY 进展奖励（始终有效，大幅增强）
-        if not hasattr(self, '_last_xy_dist') or self._last_xy_dist is None:
-            self._last_xy_dist = xy_dist
+        # ========== 核心奖励信号 ==========
         
-        xy_progress = self._last_xy_dist - xy_dist  # 正值表示靠近
-        XY_PROGRESS_SCALE = 10.0  # 大幅增强：从5.0提高到10.0
-        xy_progress_reward = XY_PROGRESS_SCALE * xy_progress
-        reward += xy_progress_reward
-        self._last_xy_dist = xy_dist
-        reward_info['xy_progress'] = xy_progress_reward
-        reward_info['xy_dist'] = xy_dist
-        
-        # XY 对齐达成奖励（增强）
-        XY_ALIGN_BONUS = 5.0  # 大幅增强：从2.0提高到5.0
-        if is_xy_aligned:
-            reward += XY_ALIGN_BONUS
-            reward_info['xy_aligned'] = XY_ALIGN_BONUS
-        
-        # [新增] 接近奖励：当XY距离小于特定阈值时给予额外奖励
-        # 解决策略在35mm处停滞的问题，提供更强的终点吸引力
-        CLOSE_THRESHOLD_1 = 0.03  # 30mm
-        CLOSE_THRESHOLD_2 = 0.02  # 20mm  
-        CLOSE_THRESHOLD_3 = 0.01  # 10mm
-        
-        # if xy_dist < CLOSE_THRESHOLD_1:
-        #     CLOSE_BONUS_1 = 1.0
-        #     reward += CLOSE_BONUS_1
-        #     reward_info['close_30mm'] = CLOSE_BONUS_1
-        # if xy_dist < CLOSE_THRESHOLD_2:
-        #     CLOSE_BONUS_2 = 2.0
-        #     reward += CLOSE_BONUS_2
-        #     reward_info['close_20mm'] = CLOSE_BONUS_2
-        if xy_dist < CLOSE_THRESHOLD_3:
-            CLOSE_BONUS_3 = 5.0
-            reward += CLOSE_BONUS_3
-            reward_info['close_10mm'] = CLOSE_BONUS_3
-        
-        # [新增] Z轴逃逸惩罚：防止策略在接近目标时向上逃逸
-        # 当XY距离小于30mm时，惩罚正向dz动作（向上移动）
-        if xy_dist < 0.03 and hasattr(self, '_current_action'):
-            dz_action = self._current_action[2] if len(self._current_action) > 2 else 0
-            if dz_action > 0:  # 正dz表示向上移动
-                Z_ESCAPE_PENALTY_SCALE = 3.0  # 惩罚系数
-                z_escape_penalty = Z_ESCAPE_PENALTY_SCALE * dz_action
-                reward -= z_escape_penalty
-                reward_info['z_escape_penalty'] = -z_escape_penalty
-        
-        # ========== 阶段 2：下降 + 抓取（仅当 XY 已对齐）==========
-        # 【简化版】：使用统一的距离势能差奖励，避免复杂分级导致局部最优
-        # if is_xy_aligned and not is_grasped:
-        if is_xy_aligned:
-            # 计算3D距离（XY已对齐，主要是Z方向）
-            dist_3d = np.sqrt(xy_dist**2 + z_dist**2)
+        if not is_grasped:
+            # 【阶段1】距离势能差：靠近得正奖励，远离得负奖励
+            rel_pos = np.array(obj_pos) - np.array(tip_pos)
+            dist = float(np.linalg.norm(rel_pos))
             
-            # 初始化距离追踪
-            if not hasattr(self, '_last_dist_3d') or self._last_dist_3d is None:
-                self._last_dist_3d = dist_3d
+            if not hasattr(self, '_prev_dist') or self._prev_dist is None:
+                self._prev_dist = dist
             
-            # 【核心奖励】距离减少 = 正奖励（势能差方式）
-            dist_progress = self._last_dist_3d - dist_3d
-            DIST_PROGRESS_SCALE = 2000.0  # 大幅增强：每减少1cm获得2.0奖励
-            dist_reward = DIST_PROGRESS_SCALE * dist_progress
-            reward += dist_reward
-            self._last_dist_3d = dist_3d
-            reward_info['dist_progress'] = dist_reward
+            # 势能差奖励：移动1cm获得1.0奖励
+            reward = (self._prev_dist - dist) * 100.0
+            self._prev_dist = dist
+            reward_info['dist'] = dist
             
-            # 【简化】距离越小，每步额外奖励越大（势能形式）
-            # 这鼓励策略快速接近，而不是慢慢移动
-            POTENTIAL_SCALE = 5.0
-            potential_reward = POTENTIAL_SCALE / (dist_3d + 0.01)  # 距离越小奖励越大
-            potential_reward = min(potential_reward, 50.0)  # 限制最大值
-            reward += potential_reward
-            reward_info['potential'] = potential_reward
-            
-            # 【修复】夹爪控制：考虑 wsg50_base_link 到指尖的偏移量（约100mm）
-            # 当 z_dist < 180mm 时，指尖距物体约 80mm，可以开始闭合
-            if z_dist < 0.18:  # 物体在夹爪抓取范围内
-                if hasattr(self, '_current_action') and len(self._current_action) > 4:
-                    gripper_action = self._current_action[4]
-                    if gripper_action < -0.2:  # 闭合夹爪
-                        GRIPPER_REWARD = 1000.0
-                        reward += GRIPPER_REWARD
-                        reward_info['gripper_close'] = GRIPPER_REWARD
+            # 【惩罚】如果之前抓住了，现在松开了 = 掉落惩罚
+            if was_grasped:
+                DROP_PENALTY = -100.0
+                reward += DROP_PENALTY
+                reward_info['drop'] = DROP_PENALTY
+                # 重置高度追踪
+                self._prev_height = None
             
         else:
-            self._last_dist_3d = None
-        
-        # 抓住物体的一次性奖励
-        if is_grasped and not getattr(self, '_grasp_rewarded', False):
-            GRASP_SUCCESS_BONUS = 500.0  # 增强：从5.0提高到10.0
-            reward += GRASP_SUCCESS_BONUS
-            reward_info['grasp_success'] = GRASP_SUCCESS_BONUS
-            self._grasp_rewarded = True
-        elif not is_grasped:
-            self._grasp_rewarded = False
-        
-        # ========== 阶段 3：抬升（仅当已抓住物体）==========
-        if is_grasped:
-            # 保持抓取奖励
-            HOLD_BONUS = 100.0  # 增强：从0.5提高到1.0
-            reward += HOLD_BONUS
-            reward_info['hold'] = HOLD_BONUS
+            # 【阶段2】抬升势能差：抬升得正奖励，下降得负奖励
+            if not hasattr(self, '_prev_height') or self._prev_height is None:
+                self._prev_height = obj_pos[2]
             
-            # 抬升进展奖励
-            if not hasattr(self, '_last_obj_z') or self._last_obj_z is None:
-                self._last_obj_z = obj_pos[2]
+            # 抬升1cm获得5.0奖励，下降1cm得-5.0惩罚
+            height_change = obj_pos[2] - self._prev_height
+            reward = height_change * 500.0
+            self._prev_height = obj_pos[2]
+            reward_info['lift'] = height_change * 500.0
             
-            lift_progress = obj_pos[2] - self._last_obj_z  # 正值表示抬升
-            LIFT_PROGRESS_SCALE = 100.0  # 增强：从5.0提高到10.0
-            lift_progress_reward = LIFT_PROGRESS_SCALE * lift_progress
-            reward += lift_progress_reward
-            self._last_obj_z = obj_pos[2]
-            reward_info['lift_progress'] = lift_progress_reward
+            # 保持抓取的小奖励
+            reward += 1.0
+            reward_info['hold'] = 1.0
             
-            # 任务完成奖励
-            if is_lifted:
-                TASK_COMPLETE_BONUS = 1000.0  # 增强：从20.0提高到50.0
-                reward += TASK_COMPLETE_BONUS
-                reward_info['task_complete'] = TASK_COMPLETE_BONUS
-        else:
-            self._last_obj_z = None
+            # 重置距离追踪（抓住后不再需要）
+            self._prev_dist = None
         
-        # [移除] 过早下压惩罚 - 这导致策略通过上升来逃避
-        # 现在用高度保持惩罚替代
+        # 【稀疏奖励】抓取成功 - 整个episode只发一次
+        if is_grasped and not getattr(self, '_grasp_bonus_given', False):
+            reward += 50.0
+            reward_info['grasp'] = 50.0
+            self._grasp_bonus_given = True
+        # 注意：不再重置 _grasp_bonus_given，防止多次获得抓取奖励
+        
+        # 【稀疏奖励】任务完成
+        if is_success and not getattr(self, '_success_bonus_given', False):
+            reward += 100.0
+            reward_info['success'] = 100.0
+            self._success_bonus_given = True
+        
+        # 更新上一步状态
+        self._was_grasped = is_grasped
         
         reward_info['total'] = reward
-        reward_info['is_grasped'] = float(is_grasped)
-        reward_info['is_xy_aligned'] = float(is_xy_aligned)
+        reward_info['grasped'] = float(is_grasped)
         
         return reward, reward_info
 
@@ -470,6 +380,9 @@ class RobotGraspEnv(gym.Env):
         self._init_gripper_link_indices()
         self._init_gripper_joint_limits()  # 启用夹爪关节硬限位
         
+        # 确保夹爪在初始状态是完全张开的
+        self._reset_gripper_to_open()
+        
         self.is_stalled = False  # 卡住检测状态
         self.success_hold_counter = 0  # 成功保持计数器
         self._last_distance = None  # 上一步距离，用于计算距离变化奖励
@@ -498,21 +411,12 @@ class RobotGraspEnv(gym.Env):
         }
         
         # 初始化距离追踪（用于奖励计算）
-        self._last_obj_pos = None
-        self._last_xy_dist = None   # XY距离追踪
-        self._last_z_dist = None    # Z距离追踪（阶段2）
-        self._last_obj_z = None     # 物体Z高度追踪（阶段3）
-        self._grasp_rewarded = False  # 抓取奖励是否已发放
-        self.initial_object_height = None  # 物体初始高度（用于抬升目标计算）
-        self._initial_tip_height = None  # 末端初始高度（用于高度保持惩罚）
-        
-        # 初始化tip位置和距离，确保第一步也有奖励信号
-        tip_pos, _ = self._get_tip_position()
-        self._last_tip_pos = np.array(tip_pos)
-        self._initial_tip_height = tip_pos[2]  # 记录初始高度
-        obj_pos, _ = self.base_env.physics_client.getBasePositionAndOrientation(self.object_id)
-        rel_pos = np.array(obj_pos) - np.array(tip_pos)
-        self._last_xy_dist = np.linalg.norm(rel_pos[:2])
+        self._prev_dist = None        # 距离追踪（阶段1）
+        self._prev_height = None      # 高度追踪（阶段2）
+        self._grasp_bonus_given = False   # 抓取奖励标记（整个episode只发一次）
+        self._success_bonus_given = False # 成功奖励标记
+        self._was_grasped = False     # 上一步是否抓住（用于检测松开）
+        self.initial_object_height = None # 物体初始高度
         
         # Gym API (兼容 SB3 旧版 VecEnv): reset 返回 obs；如需新 API 可外部包 wrapper
         obs = self._get_observation()
@@ -552,13 +456,13 @@ class RobotGraspEnv(gym.Env):
             gripper_action = gripper_action + float(np.random.normal(0.0, self.gripper_noise_std))
 
         # 夹爪逻辑：正值张开，负值闭合（与观测空间一致：+1=张开，-1=闭合）
-        # 让策略自主学习何时闭合，不设置额外限制条件
+        # 完全由策略自主学习，不添加任何限制条件
+        gripper_cmd = 0.0  # 默认保持当前状态
+        
         if gripper_action > 0.2:
             gripper_cmd = 1.0   # 张开
         elif gripper_action < -0.2:
             gripper_cmd = -1.0  # 闭合
-        else:
-            gripper_cmd = 0.0   # 中性不动，保持当前状态
 
         # 2. 获取指尖当前位姿
         pc = self.base_env.physics_client
@@ -950,89 +854,6 @@ class RobotGraspEnv(gym.Env):
             gripper_orn = st[5]
         
         return np.array(gripper_pos, dtype=np.float32), gripper_orn
-        
-        # --- 以下为旧代码（指腹中心计算），已禁用 ---
-
-        # 1) 先获取基座姿态（用于 IK/观测对齐）
-        gripper_link = self._get_gripper_base_link_index()
-        try:
-            gripper_pos, gripper_orn = self.base_env.models[0].links[gripper_link].get_pose()
-        except Exception:
-            # 最差情况：直接用 PyBullet link state
-            st = pc.getLinkState(robot_id, gripper_link)
-            gripper_pos = st[4]
-            gripper_orn = st[5]
-
-        # 2) 尝试用两指“指腹接触面中心”的中点作为 tip
-        #    这里按你的要求：以 wsg50_gripper_left / wsg50_gripper_right（两个指关节驱动的滑块 link）为基准，
-        #    通过 URDF 固定关节变换得到 finger link 的姿态，再用 finger 的碰撞盒确定“指腹平面中心”。
-
-        # finger 碰撞盒参数（rm65_wsg50.urdf）：
-        # <collision origin xyz="0 0 0.021"/>  <box size="0.01 0.01 0.075"/>
-        finger_box_center_local = np.array([0.0, 0.0, 0.021], dtype=np.float32)
-        finger_box_half_extents = np.array([0.005, 0.005, 0.0375], dtype=np.float32)
-
-        # gripper_(left/right) -> finger_(left/right) 的固定变换（rm65_wsg50.urdf）
-        # wsg50_gripper_finger_left/right: origin xyz="-0.0035 0 0.0425" rpy about z = -pi/2
-        gripper_to_finger_pos = (-0.0035, 0.0, 0.0425)
-        gripper_to_finger_orn = pc.getQuaternionFromEuler((0.0, 0.0, -np.pi / 2.0))
-
-        def _find_link_index_by_name(link_name: str):
-            try:
-                num = pc.getNumJoints(robot_id)
-            except Exception:
-                return None
-            for j in range(num):
-                info = pc.getJointInfo(robot_id, j)
-                name = info[12].decode('utf-8') if isinstance(info[12], (bytes, bytearray)) else str(info[12])
-                if name == link_name:
-                    return j
-            return None
-
-        left_gripper_idx = _find_link_index_by_name('wsg50_gripper_left')
-        right_gripper_idx = _find_link_index_by_name('wsg50_gripper_right')
-
-        if left_gripper_idx is not None and right_gripper_idx is not None:
-            try:
-                stL = pc.getLinkState(robot_id, left_gripper_idx, computeForwardKinematics=True)
-                stR = pc.getLinkState(robot_id, right_gripper_idx, computeForwardKinematics=True)
-                pL_g = stL[4]
-                qL_g = stL[5]
-                pR_g = stR[4]
-                qR_g = stR[5]
-
-                # 推到 finger link 姿态
-                pL_f, qL_f = pc.multiplyTransforms(pL_g, qL_g, gripper_to_finger_pos, gripper_to_finger_orn)
-                pR_f, qR_f = pc.multiplyTransforms(pR_g, qR_g, gripper_to_finger_pos, gripper_to_finger_orn)
-                pL_f = np.array(pL_f, dtype=np.float32)
-                pR_f = np.array(pR_f, dtype=np.float32)
-
-                vLR = (pR_f - pL_f).astype(np.float32)
-
-                def _pad_center_world(p_f, q_f, v_to_other_world):
-                    rot = np.array(pc.getMatrixFromQuaternion(q_f), dtype=np.float32).reshape(3, 3)
-                    local_v = rot.T @ v_to_other_world
-                    axis_idx = 0 if abs(float(local_v[0])) >= abs(float(local_v[1])) else 1
-                    sign = 1.0 if float(local_v[axis_idx]) >= 0.0 else -1.0
-
-                    local_offset = finger_box_center_local.copy()
-                    local_offset[axis_idx] += sign * float(finger_box_half_extents[axis_idx])
-                    return p_f + (rot @ local_offset)
-
-                padL = _pad_center_world(pL_f, qL_f, vLR)
-                padR = _pad_center_world(pR_f, qR_f, -vLR)
-                tip_pos = (padL + padR) * 0.5
-                return tip_pos, gripper_orn
-            except Exception:
-                pass
-
-        # 3) 回退：直接使用夹爪基座位置（更安全；避免错误的固定偏移污染观测/奖励）
-        print("Warning: fingertip pad center unavailable, fallback to wsg50_base_link position.")
-        if gripper_pos is not None:
-            tip_pos = np.array(gripper_pos, dtype=np.float32)
-        else:
-            tip_pos = np.zeros(3, dtype=np.float32)
-        return tip_pos, gripper_orn
     
     def _clip_joint_angles(self, angles):
         """限制关节角在有效范围内"""
@@ -1429,8 +1250,8 @@ class RobotGraspEnv(gym.Env):
         """
         self._termination_reason = None
         
-        # 1) 成功终止：末端保持在目标位置5步
-        if self.success_hold_counter > 5:
+        # 1) 成功终止：物体达到目标高度即成功（不需要悬停）
+        if self.success_hold_counter >= 1:
             self._termination_reason = 'success'
             return True
 
